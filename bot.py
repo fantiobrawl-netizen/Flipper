@@ -74,12 +74,12 @@ DEFAULT_SETTINGS = {
     "running": True,
 }
 
-API_URL = "https://portals-market.com/api/"
+API_URL = "https://portal-market.com/api/"
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Origin": "https://portals-market.com",
-    "Referer": "https://portals-market.com/",
+    "Origin": "https://portal-market.com",
+    "Referer": "https://portal-market.com/",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
@@ -276,11 +276,13 @@ async def api_get(path: str, params: dict) -> dict:
     raise RuntimeError(f"Portals {path}: нет ответа после 3 попыток")
 
 
-def _filters(params: dict, collection="", model="", backdrop="", max_price=None) -> dict:
+def _filters(params: dict, collection="", collection_id="", model="", backdrop="", max_price=None) -> dict:
     if max_price is not None:
         params["min_price"] = 0
         params["max_price"] = max(1, math.ceil(max_price))
-    if collection:
+    if collection_id:                       # поиск лотов фильтрует коллекцию по ID
+        params["collection_ids"] = collection_id
+    elif collection:                        # история сделок — по названию
         params["filter_by_collections"] = collection
     if model:
         params["filter_by_models"] = model
@@ -379,13 +381,14 @@ _cache: dict[tuple, tuple[float, list]] = {}
 CACHE_TTL = {"listings": 90, "sales": 600}
 
 
-async def cached(kind: str, collection: str, model: str) -> list[dict]:
+async def cached(kind: str, collection: str, collection_id: str, model: str) -> list[dict]:
     key = (kind, collection, model)
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_TTL[kind]:
         return hit[1]
     if kind == "listings":
-        data = await search_listings("price asc", limit=20, collection=collection, model=model)
+        data = await search_listings("price asc", limit=20, collection_id=collection_id,
+                                     collection="" if collection_id else collection, model=model)
     else:
         data = await search_sales(limit=50, collection=collection, model=model)
     _cache[key] = (time.time(), data)
@@ -410,8 +413,8 @@ async def estimate(lot: dict) -> dict | None:
     if model == "?":
         return None
 
-    listings = [x for x in await cached("listings", name, model) if x.get("id") != lot.get("id")]
-    sales_raw = await cached("sales", name, model)
+    listings = [x for x in await cached("listings", name, lot.get("collection_id") or "", model) if x.get("id") != lot.get("id")]
+    sales_raw = await cached("sales", name, "", model)
 
     def price(x, field="price"):
         try:
