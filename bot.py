@@ -299,8 +299,9 @@ async def search_listings(sort: str, limit=20, offset=0, **flt) -> list[dict]:
     return (await api_get("nfts/search", params)).get("results") or []
 
 
-async def search_sales(limit=50, **flt) -> list[dict]:
-    params = _filters({"offset": 0, "limit": limit, "sort_by": "listed_at desc",
+async def search_sales(limit=20, offset=0, **flt) -> list[dict]:
+    # Portals: limit не больше 20, коллекция — по collection_ids
+    params = _filters({"offset": offset, "limit": min(limit, 20), "sort_by": "created_at desc",
                        "action_types": "buy"}, **flt)
     return (await api_get("market/actions/", params)).get("actions") or []
 
@@ -393,7 +394,16 @@ async def cached(kind: str, collection: str, collection_id: str, model: str) -> 
         data = await search_listings("price asc", limit=20, collection_id=collection_id,
                                      collection="" if collection_id else collection, model=model)
     else:
-        data = await search_sales(limit=50, collection=collection, model=model)
+        data = []
+        try:
+            for page in range(2):  # до 40 последних продаж
+                part = await search_sales(offset=page * 20, collection_id=collection_id,
+                                          collection="" if collection_id else collection, model=model)
+                data += part
+                if len(part) < 20:
+                    break
+        except Exception as e:
+            log.warning("История продаж недоступна: %s", e)
     _cache[key] = (time.time(), data)
     return data
 
@@ -417,7 +427,7 @@ async def estimate(lot: dict) -> dict | None:
         return None
 
     listings = [x for x in await cached("listings", name, lot.get("collection_id") or "", model) if x.get("id") != lot.get("id")]
-    sales_raw = await cached("sales", name, "", model)
+    sales_raw = await cached("sales", name, lot.get("collection_id") or "", model)
 
     def price(x, field="price"):
         try:
@@ -704,7 +714,7 @@ async def cmd_debug(m: Message):
             same = await search_listings("price asc", limit=5, collection_id=lot.get("collection_id") or "",
                                          model=attr(lot, "model")[0])
             lines.append(f"✅ Та же модель на рынке: {len(same)} шт.")
-            sales = await search_sales(limit=10, collection=lot.get("name") or "", model=attr(lot, "model")[0])
+            sales = await search_sales(collection_id=lot.get("collection_id") or "", model=attr(lot, "model")[0])
             lines.append(f"✅ Продажи модели: {len(sales)} шт.")
             if sales:
                 lines.append(f"Поля продажи: <code>{', '.join(sorted(sales[0].keys()))[:200]}</code>")
