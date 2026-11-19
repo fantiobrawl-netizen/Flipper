@@ -1,0 +1,69 @@
+name: Portals Flipper
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # каждые 30 минут ставит в очередь следующую «смену»
+  workflow_dispatch:          # кнопка ручного запуска в Actions
+
+# Всегда работает только одна копия бота; следующая ждёт в очереди и стартует сразу после.
+concurrency:
+  group: portals-flipper
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write              # для кэша состояния и защиты от авто-отключения расписания
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # Настройки (баланс, скидка) и уже просмотренные лоты переживают перезапуски
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: flipper-state-${{ github.run_id }}
+          restore-keys: flipper-state-
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          # Необязательные переменные: Settings → Secrets and variables → Actions → Variables
+          BALANCE: ${{ vars.BALANCE }}
+          DISCOUNT: ${{ vars.DISCOUNT }}
+          MIN_PROFIT: ${{ vars.MIN_PROFIT }}
+          BUYER_FEE: ${{ vars.BUYER_FEE }}
+          SELLER_FEE: ${{ vars.SELLER_FEE }}
+          POLL_SECONDS: ${{ vars.POLL_SECONDS }}
+          RUN_MINUTES: "340"
+        run: python bot.py
+
+      - name: Save state
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: flipper-state-${{ github.run_id }}
+
+      # GitHub отключает расписание в репозиториях без активности 60 дней — включаем обратно
+      - name: Keep schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable flipper.yml --repo "${{ github.repository }}" || true

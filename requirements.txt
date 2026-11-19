@@ -1,0 +1,4 @@
+aiogram>=3.7
+curl_cffi>=0.7
+kurigram>=2.1
+tgcrypto
