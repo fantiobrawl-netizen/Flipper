@@ -258,14 +258,17 @@ http: AsyncSession | None = None
 
 
 async def api_get(path: str, params: dict) -> dict:
-    need_new_token = False
+    refreshed = False
     for attempt in range(3):
-        token = await auth.get(force=need_new_token)
+        token = await auth.get()
         r = await http.get(API_URL + path, params=params,
                            headers={**HEADERS, "Authorization": token},
-                           impersonate="chrome110", timeout=20)
+                           impersonate="chrome110", timeout=15)
         if r.status_code in (401, 403):
-            need_new_token = True
+            if refreshed:
+                raise RuntimeError(f"Portals {path}: доступ запрещён (HTTP {r.status_code}): {r.text[:200]}")
+            await auth.get(force=True)
+            refreshed = True
             continue
         if r.status_code == 429:
             await asyncio.sleep(5 * (attempt + 1))
@@ -535,24 +538,35 @@ def format_lot(lot, price, cost, discount, sell_price, net, est) -> str:
     return "\n".join(lines)
 
 
-async def scan(bot: Bot, pages: int = 1) -> int:
-    found = 0
+scan_lock = asyncio.Lock()
+
+
+async def scan(bot: Bot, pages: int = 1, recheck: bool = False) -> dict:
+    """recheck=True — проверить и уже просмотренные лоты (для /scan)."""
+    stats = {"lots": 0, "checked": 0, "found": 0, "errors": 0, "first_error": ""}
     max_price = settings["balance"] / (1 + BUYER_FEE)
-    for page in range(pages):
-        lots = await search_listings("listed_at desc", limit=20, offset=page * 20, max_price=max_price)
-        for lot in lots:
-            lot_id = lot.get("id")
-            if not lot_id or lot_id in seen_ids:
-                continue
-            remember(lot_id)
-            try:
-                found += await check_lot(bot, lot)
-            except Exception as e:
-                log.warning("Лот %s: %s", lot_id, e)
-        if len(lots) < 20:
-            break
-    save_state()
-    return found
+    async with scan_lock:
+        for page in range(pages):
+            lots = await search_listings("listed_at desc", limit=20, offset=page * 20, max_price=max_price)
+            stats["lots"] += len(lots)
+            for lot in lots:
+                lot_id = lot.get("id")
+                if not lot_id or (lot_id in seen_ids and not recheck):
+                    continue
+                remember(lot_id)
+                stats["checked"] += 1
+                try:
+                    stats["found"] += await check_lot(bot, lot)
+                except Exception as e:
+                    stats["errors"] += 1
+                    stats["first_error"] = stats["first_error"] or str(e)[:300]
+                    log.warning("Лот %s: %s", lot_id, e)
+                    if stats["errors"] >= 3 and stats["checked"] == stats["errors"]:
+                        raise RuntimeError(f"Все проверки падают: {stats['first_error']}")
+            if len(lots) < 20:
+                break
+        save_state()
+    return stats
 
 
 async def scanner_loop(bot: Bot) -> None:
@@ -583,6 +597,7 @@ HELP = (
     "/discount 15 — мин. скидка от оценки рынка, %\n"
     "/profit 0.5 — мин. чистая прибыль, TON\n"
     "/scan — проверить последние ~100 лотов\n"
+    "/debug — проверить связь с Portals\n"
     "/pause, /resume, /status\n"
     "/login — заново войти по QR"
 )
@@ -660,11 +675,42 @@ async def cmd_pause(m: Message, command: CommandObject):
 async def cmd_scan(m: Message):
     if settings["balance"] <= 0:
         return await m.answer("Сначала отправьте баланс числом.")
-    await m.answer("🔎 Проверяю последние лоты…")
+    await m.answer("🔎 Проверяю последние лоты (до минуты)…")
+    started = time.time()
     try:
-        await m.answer(f"Готово. Найдено: <b>{await scan(m.bot, pages=5)}</b>")
+        st = await scan(m.bot, pages=5, recheck=True)
+        text = (f"Готово за {time.time() - started:.0f} с.\n"
+                f"Лотов в бюджете: {st['lots']}, проверено: {st['checked']}\n"
+                f"Выгодных: <b>{st['found']}</b>")
+        if st["errors"]:
+            text += f"\n⚠️ Ошибок: {st['errors']}\n<code>{st['first_error']}</code>"
+        await m.answer(text)
     except Exception as e:
         await m.answer(f"⚠️ <code>{str(e)[:300]}</code>")
+
+
+@dp.message(owner, Command("debug"))
+async def cmd_debug(m: Message):
+    """Показывает, что отвечает Portals на каждый тип запроса."""
+    lines = []
+    try:
+        lots = await search_listings("listed_at desc", limit=3)
+        lines.append(f"✅ Лоты: {len(lots)} шт.")
+        if lots:
+            lot = lots[0]
+            lines.append(f"Пример: {lot.get('name')} #{gift_number(lot)} — {lot.get('price')} TON, "
+                         f"модель {attr(lot, 'model')[0]}, фон {attr(lot, 'backdrop')[0]}")
+            lines.append(f"Поля: <code>{', '.join(sorted(lot.keys()))[:300]}</code>")
+            same = await search_listings("price asc", limit=5, collection_id=lot.get("collection_id") or "",
+                                         model=attr(lot, "model")[0])
+            lines.append(f"✅ Та же модель на рынке: {len(same)} шт.")
+            sales = await search_sales(limit=10, collection=lot.get("name") or "", model=attr(lot, "model")[0])
+            lines.append(f"✅ Продажи модели: {len(sales)} шт.")
+            if sales:
+                lines.append(f"Поля продажи: <code>{', '.join(sorted(sales[0].keys()))[:200]}</code>")
+    except Exception as e:
+        lines.append(f"❌ <code>{str(e)[:400]}</code>")
+    await m.answer("\n".join(lines))
 
 
 @dp.message(owner, Command("login"))
