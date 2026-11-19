@@ -29,14 +29,17 @@
 ```
 ```python
 from pyrogram import Client
-api_id = int(input("API_ID: ")); api_hash = input("API_HASH: ")
-async with Client("login", api_id=api_id, api_hash=api_hash, in_memory=True) as c:
+api_id = int(input("API_ID: ")); api_hash = input("API_HASH: ").strip()
+phone = input("Ваш номер телефона (например +79991234567): ").strip()
+async with Client("login", api_id=api_id, api_hash=api_hash, phone_number=phone, in_memory=True) as c:
+    me = await c.get_me()
+    assert not me.is_bot, "Нужен вход по номеру телефона, а не токеном бота"
     s = await c.export_session_string()
     await c.send_message("me", "TG_SESSION (никому не показывайте):")
     await c.send_message("me", s)
 print("Готово — смотрите «Избранное» в Telegram")
 ```
-Введите номер телефона и код из Telegram. Строка сессии придёт вам в «Избранное».
+Введите **свой номер телефона** (не токен бота!), затем код из Telegram. Если включена двухэтапная проверка, введите и облачный пароль. Строка сессии придёт вам в «Избранное».
 
 **С компьютера:** `pip install kurigram tgcrypto && python login.py`.
 

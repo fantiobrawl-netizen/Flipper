@@ -12,7 +12,11 @@ from pyrogram import Client
 async def main():
     api_id = int(input("API_ID: ").strip())
     api_hash = input("API_HASH: ").strip()
-    async with Client("login", api_id=api_id, api_hash=api_hash, in_memory=True) as client:
+    phone = input("Ваш номер телефона (например +79991234567): ").strip()
+    async with Client("login", api_id=api_id, api_hash=api_hash,
+                      phone_number=phone, in_memory=True) as client:
+        if (await client.get_me()).is_bot:
+            raise SystemExit("Нужен вход по номеру телефона, а не токеном бота.")
         session = await client.export_session_string()
         await client.send_message("me", "TG_SESSION для Portals Flipper. НИКОМУ не показывайте:")
         await client.send_message("me", session)
