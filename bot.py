@@ -477,7 +477,7 @@ async def estimate(lot: dict) -> dict | None:
 # ───────────────────────── Проверка лотов ─────────────────────────
 
 
-async def check_lot(bot: Bot, lot: dict) -> bool:
+async def check_lot(bot: Bot, lot: dict, stats: dict | None = None) -> bool:
     try:
         price = float(lot.get("price") or 0)
     except ValueError:
@@ -488,11 +488,20 @@ async def check_lot(bot: Bot, lot: dict) -> bool:
 
     est = await estimate(lot)
     if not est:
+        if stats is not None:
+            stats["no_estimate"] += 1
         return False
     fair = est["fair"]
     discount = (1 - price / fair) * 100
     sell_price = fair * (1 - UNDERCUT)
     net = sell_price * (1 - SELLER_FEE) - cost
+    if stats is not None:
+        stats["estimated"] += 1
+        stats["with_sales"] += not est["only_listings"]
+        stats["top"].append((discount, net, f"{lot.get('name')} #{gift_number(lot)} "
+                             f"({attr(lot, 'model')[0]}): {fmt(price)} → оценка {fmt(fair)}"))
+    log.info("Лот %s #%s: цена %s, оценка %s, скидка %.1f%%, прибыль %.2f",
+             lot.get("name"), gift_number(lot), price, fair, discount, net)
     if discount < settings["discount"] or net < settings["min_profit"]:
         return False
 
@@ -553,7 +562,8 @@ scan_lock = asyncio.Lock()
 
 async def scan(bot: Bot, pages: int = 1, recheck: bool = False) -> dict:
     """recheck=True — проверить и уже просмотренные лоты (для /scan)."""
-    stats = {"lots": 0, "checked": 0, "found": 0, "errors": 0, "first_error": ""}
+    stats = {"lots": 0, "checked": 0, "found": 0, "errors": 0, "first_error": "",
+             "estimated": 0, "with_sales": 0, "no_estimate": 0, "top": []}
     max_price = settings["balance"] / (1 + BUYER_FEE)
     async with scan_lock:
         for page in range(pages):
@@ -566,7 +576,7 @@ async def scan(bot: Bot, pages: int = 1, recheck: bool = False) -> dict:
                 remember(lot_id)
                 stats["checked"] += 1
                 try:
-                    stats["found"] += await check_lot(bot, lot)
+                    stats["found"] += await check_lot(bot, lot, stats)
                 except Exception as e:
                     stats["errors"] += 1
                     stats["first_error"] = stats["first_error"] or str(e)[:300]
@@ -576,6 +586,10 @@ async def scan(bot: Bot, pages: int = 1, recheck: bool = False) -> dict:
             if len(lots) < 20:
                 break
         save_state()
+    stats["top"].sort(key=lambda x: -x[0])
+    log.info("Скан: лотов %s, проверено %s, оценено %s (с продажами %s), без оценки %s, найдено %s, ошибок %s",
+             stats["lots"], stats["checked"], stats["estimated"], stats["with_sales"],
+             stats["no_estimate"], stats["found"], stats["errors"])
     return stats
 
 
@@ -691,7 +705,12 @@ async def cmd_scan(m: Message):
         st = await scan(m.bot, pages=5, recheck=True)
         text = (f"Готово за {time.time() - started:.0f} с.\n"
                 f"Лотов в бюджете: {st['lots']}, проверено: {st['checked']}\n"
-                f"Выгодных: <b>{st['found']}</b>")
+                f"Оценено: {st['estimated']} (по продажам: {st['with_sales']}), "
+                f"без данных для оценки: {st['no_estimate']}\n"
+                f"Выгодных (от {fmt(settings['discount'])}%): <b>{st['found']}</b>")
+        if st["top"]:
+            text += "\n\n<b>Ближе всего к порогу:</b>\n" + "\n".join(
+                f"{d:+.0f}% · {n:+.2f} TON · {t}" for d, n, t in st["top"][:5])
         if st["errors"]:
             text += f"\n⚠️ Ошибок: {st['errors']}\n<code>{st['first_error']}</code>"
         await m.answer(text)
