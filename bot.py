@@ -24,15 +24,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
+import base64
+import hashlib
+import io
+
+import qrcode
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, InputMediaPhoto, Message
+from cryptography.fernet import Fernet, InvalidToken
 from curl_cffi.requests import AsyncSession
-from pyrogram import Client
-from pyrogram.raw.functions.messages import RequestAppWebView
-from pyrogram.raw.functions.users import GetUsers
-from pyrogram.raw.types import InputBotAppShortName, InputUser
+from telethon import TelegramClient, functions, types, utils
+from telethon.errors import SessionPasswordNeededError, PasswordHashInvalidError
+from telethon.sessions import StringSession
 
 # ───────────────────────── Настройки (из GitHub Secrets / Variables) ─────────────────────────
 
@@ -113,21 +118,121 @@ def remember(lot_id: str) -> None:
 # ───────────────────────── Авторизация в Portals ─────────────────────────
 
 
+# Сессия Telegram хранится в кэше GitHub в ЗАШИФРОВАННОМ виде (ключ — из ваших секретов).
+SESSION_FILE = STATE_DIR / "session.enc"
+_fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(f"{BOT_TOKEN}|{API_HASH}".encode()).digest()))
+
+tg: TelegramClient | None = None
+tg_ready = asyncio.Event()
+password_waiter: asyncio.Future | None = None
+login_task: asyncio.Task | None = None
+
+
+def load_session() -> str:
+    if TG_SESSION:
+        return TG_SESSION
+    try:
+        return _fernet.decrypt(SESSION_FILE.read_bytes()).decode()
+    except (FileNotFoundError, InvalidToken):
+        return ""
+
+
+def store_session(s: str) -> None:
+    SESSION_FILE.write_bytes(_fernet.encrypt(s.encode()))
+
+
+def qr_png(url: str) -> BufferedInputFile:
+    buf = io.BytesIO()
+    qrcode.make(url, box_size=10, border=3).save(buf, format="PNG")
+    return BufferedInputFile(buf.getvalue(), filename="login.png")
+
+
+QR_TEXT = (
+    "📲 <b>Вход в Telegram для доступа к Portals</b>\n\n"
+    "Отсканируйте этот QR <b>телефоном</b>:\n"
+    "Telegram → Настройки → Устройства → <b>Подключить устройство</b>\n\n"
+    "QR должен быть на другом экране: откройте этот чат на компьютере "
+    "(или на web.telegram.org) либо покажите скриншот на другом устройстве.\n"
+    "Код обновляется каждые 30 секунд."
+)
+
+
+async def qr_login(bot: Bot) -> None:
+    """Вход по QR-коду через бота: без номера телефона и кодов."""
+    global tg, password_waiter
+    client = TelegramClient(StringSession(), int(API_ID), API_HASH)
+    await client.connect()
+    qr = await client.qr_login()
+    msg = await bot.send_photo(OWNER_ID, qr_png(qr.url), caption=QR_TEXT)
+    deadline = time.time() + 10 * 60
+    try:
+        while True:
+            try:
+                await qr.wait(timeout=25)
+                break
+            except asyncio.TimeoutError:
+                if time.time() > deadline:
+                    await bot.send_message(OWNER_ID, "⌛ QR не отсканирован. Отправьте /login, чтобы получить новый.")
+                    await client.disconnect()
+                    return
+                await qr.recreate()
+                await bot.edit_message_media(
+                    media=InputMediaPhoto(media=qr_png(qr.url), caption=QR_TEXT),
+                    chat_id=OWNER_ID, message_id=msg.message_id)
+            except SessionPasswordNeededError:
+                while True:
+                    password_waiter = asyncio.get_running_loop().create_future()
+                    await bot.send_message(OWNER_ID, "🔐 У аккаунта включена двухэтапная проверка.\n"
+                                                     "Отправьте сюда облачный пароль. Сообщение с ним я сразу удалю.")
+                    password = await password_waiter
+                    try:
+                        await client.sign_in(password=password)
+                        break
+                    except PasswordHashInvalidError:
+                        await bot.send_message(OWNER_ID, "❌ Неверный пароль, попробуйте ещё раз.")
+                break
+    finally:
+        password_waiter = None
+        try:
+            await bot.delete_message(OWNER_ID, msg.message_id)
+        except Exception:
+            pass
+
+    me = await client.get_me()
+    store_session(client.session.save())
+    save_state()
+    tg = client
+    tg_ready.set()
+    await bot.send_message(OWNER_ID, f"✅ Вход выполнен: {me.first_name}. Начинаю искать лоты.")
+
+
+async def ensure_telegram(bot: Bot) -> None:
+    """Подключает сохранённую сессию или запускает вход по QR."""
+    global tg, login_task
+    session = load_session()
+    if session:
+        client = TelegramClient(StringSession(session), int(API_ID), API_HASH)
+        await client.connect()
+        if await client.is_user_authorized():
+            tg = client
+            tg_ready.set()
+            return
+        await client.disconnect()
+        await bot.send_message(OWNER_ID, "⚠️ Сохранённый вход больше не действует, нужен новый.")
+    login_task = asyncio.create_task(qr_login(bot))
+
+
 async def fetch_tma_token() -> str:
     """Открывает мини-приложение Portals от имени вашего аккаунта и берёт initData."""
-    client = Client("flipper", api_id=int(API_ID), api_hash=API_HASH,
-                    session_string=TG_SESSION, in_memory=True, no_updates=True)
-    async with client:
-        peer = await client.resolve_peer("portals")
-        users = await client.invoke(GetUsers(id=[peer]))
-        bot_user = InputUser(user_id=users[0].id, access_hash=users[0].access_hash)
-        web_view = await client.invoke(
-            RequestAppWebView(
-                peer=peer,
-                app=InputBotAppShortName(bot_id=bot_user, short_name="market"),
-                platform="desktop",
-            )
-        )
+    await tg_ready.wait()
+    if not tg.is_connected():
+        await tg.connect()
+    bot_user = utils.get_input_user(await tg.get_input_entity("portals"))
+    web_view = await tg(functions.messages.RequestAppWebViewRequest(
+        peer=bot_user,
+        app=types.InputBotAppShortName(bot_id=bot_user, short_name="market"),
+        platform="desktop",
+    ))
     init_data = unquote(web_view.url.split("tgWebAppData=", 1)[1].split("&tgWebAppVersion", 1)[0])
     return f"tma {init_data}"
 
@@ -450,6 +555,7 @@ async def scan(bot: Bot, pages: int = 1) -> int:
 async def scanner_loop(bot: Bot) -> None:
     errors = 0
     while True:
+        await tg_ready.wait()
         if settings["running"] and settings["balance"] > 0:
             try:
                 await scan(bot)
@@ -474,7 +580,8 @@ HELP = (
     "/discount 15 — мин. скидка от оценки рынка, %\n"
     "/profit 0.5 — мин. чистая прибыль, TON\n"
     "/scan — проверить последние ~100 лотов\n"
-    "/pause, /resume, /status"
+    "/pause, /resume, /status\n"
+    "/login — заново войти по QR"
 )
 
 
@@ -557,6 +664,28 @@ async def cmd_scan(m: Message):
         await m.answer(f"⚠️ <code>{str(e)[:300]}</code>")
 
 
+@dp.message(owner, Command("login"))
+async def cmd_login(m: Message):
+    global login_task, tg
+    if login_task and not login_task.done():
+        return await m.answer("QR уже отправлен выше — отсканируйте его.")
+    tg_ready.clear()
+    if tg:
+        await tg.disconnect()
+        tg = None
+    SESSION_FILE.unlink(missing_ok=True)
+    login_task = asyncio.create_task(qr_login(m.bot))
+
+
+@dp.message(owner, F.text, lambda m: password_waiter is not None and not password_waiter.done())
+async def got_password(m: Message):
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    password_waiter.set_result(m.text)
+
+
 @dp.message(owner, F.text)
 async def plain_number(m: Message):
     v = parse_number(m.text)
@@ -574,19 +703,20 @@ async def stop_after(minutes: float):
 
 async def main():
     global http
-    required = {"BOT_TOKEN": BOT_TOKEN, "OWNER_ID": OWNER_ID, "API_ID": API_ID,
-                "API_HASH": API_HASH, "TG_SESSION": TG_SESSION}
+    required = {"BOT_TOKEN": BOT_TOKEN, "OWNER_ID": OWNER_ID, "API_ID": API_ID, "API_HASH": API_HASH}
     missing = [k for k, v in required.items() if not v]
     if missing:
         raise SystemExit(f"Не заданы секреты: {', '.join(missing)}")
 
     http = AsyncSession()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    try:
-        await auth.get()
-    except Exception as e:
-        await bot.send_message(OWNER_ID, f"❌ Не удалось войти в Portals. Проверьте TG_SESSION.\n<code>{str(e)[:300]}</code>")
-        raise
+    await ensure_telegram(bot)
+    if tg_ready.is_set():
+        try:
+            await auth.get()
+        except Exception as e:
+            await bot.send_message(OWNER_ID, f"❌ Не удалось получить доступ к Portals:\n<code>{str(e)[:300]}</code>")
+            raise
     if RUN_MINUTES:
         asyncio.create_task(stop_after(RUN_MINUTES))
     asyncio.create_task(scanner_loop(bot))
