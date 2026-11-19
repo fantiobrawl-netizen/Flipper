@@ -25,6 +25,8 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import base64
+import colorsys
+import tempfile
 import hashlib
 import io
 
@@ -36,7 +38,8 @@ from aiogram.types import BufferedInputFile, InputMediaPhoto, Message
 from cryptography.fernet import Fernet, InvalidToken
 from curl_cffi.requests import AsyncSession
 from telethon import TelegramClient, functions, types, utils
-from telethon.errors import SessionPasswordNeededError, PasswordHashInvalidError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, PasswordHashInvalidError
+from rlottie_python import LottieAnimation
 from telethon.sessions import StringSession
 
 # ───────────────────────── Настройки (из GitHub Secrets / Variables) ─────────────────────────
@@ -279,7 +282,10 @@ async def api_get(path: str, params: dict) -> dict:
     raise RuntimeError(f"Portals {path}: нет ответа после 3 попыток")
 
 
-def _filters(params: dict, collection="", collection_id="", model="", backdrop="", max_price=None) -> dict:
+def _filters(params: dict, collection="", collection_id="", model="", backdrop="", max_price=None,
+             external_collection_number=None) -> dict:
+    if external_collection_number:
+        params["external_collection_number"] = external_collection_number
     if max_price is not None:
         params["min_price"] = 0
         params["max_price"] = max(1, math.ceil(max_price))
@@ -344,68 +350,21 @@ def number_tag(n: int | None) -> str:
     return ", ".join(tags)
 
 
-# Цветовые семейства для эвристики «монохрома»: модель и фон одного цвета.
-COLOR_FAMILIES = {
-    "чёрный": ["black", "onyx", "obsidian", "raven", "midnight", "shadow", "dark", "noir", "ink", "coal", "night"],
-    "белый": ["white", "ivory", "pearl", "snow", "milk", "frost", "cream", "light"],
-    "серый": ["gray", "grey", "silver", "steel", "ash", "smoke", "platinum", "stone", "graphite"],
-    "красный": ["red", "ruby", "crimson", "scarlet", "cherry", "carmine", "blood", "wine", "burgundy", "fire"],
-    "розовый": ["pink", "rose", "magenta", "fuchsia", "flamingo", "blush", "strawberry"],
-    "оранжевый": ["orange", "tangerine", "coral", "copper", "pumpkin", "carrot", "peach", "apricot"],
-    "жёлтый": ["yellow", "gold", "golden", "amber", "lemon", "honey", "banana", "sun", "mustard"],
-    "зелёный": ["green", "emerald", "mint", "jade", "lime", "malachite", "olive", "forest", "toxic", "pine", "moss"],
-    "голубой": ["cyan", "turquoise", "aqua", "sky", "azure", "teal", "ice", "celeste"],
-    "синий": ["blue", "sapphire", "navy", "cobalt", "ocean", "indigo", "denim", "ultramarine"],
-    "фиолетовый": ["purple", "violet", "amethyst", "lavender", "lilac", "plum", "grape", "orchid", "mystic"],
-    "коричневый": ["brown", "chocolate", "coffee", "caramel", "bronze", "mocha", "wood", "cocoa", "rust"],
-}
-
-
-def color_family(name: str) -> str | None:
-    words = re.findall(r"[a-z]+", name.lower())
-    for family, keys in COLOR_FAMILIES.items():
-        if any(w in keys for w in words):
-            return family
-    return None
-
-
-def monochrome(model: str, backdrop: str) -> str | None:
-    fm, fb = color_family(model), color_family(backdrop)
-    return fm if fm and fm == fb else None
+def gift_slug(nft: dict) -> str:
+    name = (nft.get("name") or "").replace("'", "").replace("’", "")
+    short = "".join(p[:1].upper() + p[1:] for p in re.split(r"[^0-9A-Za-z]+", name) if p)
+    return f"{short}-{gift_number(nft)}"
 
 
 def nft_link(nft: dict) -> str:
-    name = (nft.get("name") or "").replace("'", "").replace("’", "")
-    short = "".join(p[:1].upper() + p[1:] for p in re.split(r"[^0-9A-Za-z]+", name) if p)
-    return f"https://t.me/nft/{short}-{gift_number(nft)}"
-
-# ───────────────────────── Оценка цены ─────────────────────────
-
-_cache: dict[tuple, tuple[float, list]] = {}
-CACHE_TTL = {"listings": 90, "sales": 600}
+    return f"https://t.me/nft/{gift_slug(nft)}"
 
 
-async def cached(kind: str, collection: str, collection_id: str, model: str) -> list[dict]:
-    key = (kind, collection, model)
-    hit = _cache.get(key)
-    if hit and time.time() - hit[0] < CACHE_TTL[kind]:
-        return hit[1]
-    if kind == "listings":
-        data = await search_listings("price asc", limit=20, collection_id=collection_id,
-                                     collection="" if collection_id else collection, model=model)
-    else:
-        data = []
-        try:
-            for page in range(2):  # до 40 последних продаж
-                part = await search_sales(offset=page * 20, collection_id=collection_id,
-                                          collection="" if collection_id else collection, model=model)
-                data += part
-                if len(part) < 20:
-                    break
-        except Exception as e:
-            log.warning("История продаж недоступна: %s", e)
-    _cache[key] = (time.time(), data)
-    return data
+def to_float(x, field="price") -> float:
+    try:
+        return float((x or {}).get(field) or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def parse_time(value) -> datetime | None:
@@ -415,144 +374,414 @@ def parse_time(value) -> datetime | None:
         return None
 
 
+def fmt(v: float | None) -> str:
+    return f"{v:.2f}".rstrip("0").rstrip(".") if v is not None else "—"
+
+# ───────────────────────── Монохром по реальным цветам ─────────────────────────
+# Цвет фона берём у Telegram (center_color), цвет модели — рендерим её стикер
+# и считаем, какая доля цветных пикселей модели совпадает по оттенку с фоном.
+
+COLORS_FILE = STATE_DIR / "colors.json"
+_colors = load_json(COLORS_FILE, {"backdrops": {}, "models": {}})
+_tg_sem = asyncio.Semaphore(1)
+MONO_THRESHOLD = 0.40  # >= 40% цветных пикселей модели в оттенке фона — монохром
+
+
+def save_colors() -> None:
+    COLORS_FILE.write_text(json.dumps(_colors, ensure_ascii=False), encoding="utf-8")
+
+
+def rgb_to_hsl(rgb: int) -> tuple[float, float, float]:
+    r, g, b = ((rgb >> 16) & 255) / 255, ((rgb >> 8) & 255) / 255, (rgb & 255) / 255
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    return h * 360, s, l
+
+
+def model_pixels(tgs: bytes) -> list[list[float]]:
+    """Рендерит модель и возвращает выборку пикселей [hue, sat, light]."""
+    with tempfile.NamedTemporaryFile(suffix=".tgs") as f:
+        f.write(tgs)
+        f.flush()
+        anim = LottieAnimation.from_tgs(f.name)
+        frames = max(1, anim.lottie_animation_get_totalframe())
+        img = anim.render_pillow_frame(frame_num=frames // 2, width=96, height=96)
+    pixels = []
+    for r, g, b, a in img.getdata():
+        if a < 200:
+            continue
+        h, l, s = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+        pixels.append([round(h * 360, 1), round(s, 3), round(l, 3)])
+    return pixels[::3]
+
+
+def mono_share(pixels: list, backdrop_rgb: int) -> float:
+    """Доля пикселей модели того же цвета, что и фон."""
+    if not pixels:
+        return 0.0
+    bh, bs, bl = rgb_to_hsl(backdrop_rgb)
+    if bs < 0.15:  # чёрный / белый / серый фон: сравниваем светлоту бесцветных пикселей
+        same = [p for p in pixels if (p[1] < 0.25 or p[2] < 0.12 or p[2] > 0.9) and abs(p[2] - bl) < 0.25]
+        return len(same) / len(pixels)
+    colored = [p for p in pixels if p[1] >= 0.2 and 0.12 < p[2] < 0.92]
+    if len(colored) < len(pixels) * 0.15:
+        return 0.0
+    same = [p for p in colored if min(abs(p[0] - bh), 360 - abs(p[0] - bh)) <= 40]
+    return len(same) / len(colored)
+
+
+async def learn_colors(nft: dict) -> None:
+    """Узнаёт у Telegram цвет фона и картинку модели (один раз на фон и на модель)."""
+    model, _ = attr(nft, "model")
+    backdrop, _ = attr(nft, "backdrop")
+    mkey = f"{nft.get('name')}|{model}"
+    if backdrop in _colors["backdrops"] and mkey in _colors["models"]:
+        return
+    if not tg_ready.is_set() or not gift_number(nft):
+        return
+    async with _tg_sem:
+        if backdrop in _colors["backdrops"] and mkey in _colors["models"]:
+            return
+        try:
+            res = await tg(functions.payments.GetUniqueStarGiftRequest(slug=gift_slug(nft)))
+            for a in res.gift.attributes:
+                if isinstance(a, types.StarGiftAttributeBackdrop):
+                    _colors["backdrops"][a.name] = a.center_color
+                elif isinstance(a, types.StarGiftAttributeModel) and mkey not in _colors["models"]:
+                    tgs = await tg.download_media(a.document, file=bytes)
+                    _colors["models"][mkey] = await asyncio.to_thread(model_pixels, tgs)
+            save_colors()
+        except FloodWaitError as e:
+            log.warning("Telegram просит подождать %s с (цвета подарков)", e.seconds)
+            await asyncio.sleep(min(e.seconds, 60))
+        except Exception as e:
+            log.warning("Цвета %s: %s", gift_slug(nft), e)
+            _colors["models"].setdefault(mkey, [])
+        await asyncio.sleep(0.4)
+
+
+def mono_of(nft: dict) -> float | None:
+    """Доля совпадения цвета (0..1) или None, если цвета ещё неизвестны."""
+    model, _ = attr(nft, "model")
+    backdrop, _ = attr(nft, "backdrop")
+    pixels = _colors["models"].get(f"{nft.get('name')}|{model}")
+    rgb = _colors["backdrops"].get(backdrop)
+    if not pixels or rgb is None:
+        return None
+    return mono_share(pixels, rgb)
+
+
+def is_mono(nft: dict) -> bool:
+    share = mono_of(nft)
+    return share is not None and share >= MONO_THRESHOLD
+
+# ───────────────────────── Данные рынка ─────────────────────────
+
+_cache: dict[tuple, tuple[float, list]] = {}
+CACHE_TTL = {"listings": 90, "sales": 600, "history": 600}
+
+
+async def model_listings(lot: dict) -> list[dict]:
+    model, _ = attr(lot, "model")
+    key = ("listings", lot.get("collection_id"), model)
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < CACHE_TTL["listings"]:
+        return hit[1]
+    data = await search_listings("price asc", limit=20, collection_id=lot.get("collection_id") or "",
+                                 collection="" if lot.get("collection_id") else lot.get("name") or "",
+                                 model=model)
+    _cache[key] = (time.time(), data)
+    return data
+
+
+async def model_sales(lot: dict) -> list[dict]:
+    model, _ = attr(lot, "model")
+    key = ("sales", lot.get("collection_id"), model)
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < CACHE_TTL["sales"]:
+        return hit[1]
+    data = []
+    try:
+        for page in range(2):  # до 40 последних продаж модели
+            part = await search_sales(offset=page * 20, collection_id=lot.get("collection_id") or "",
+                                      collection="" if lot.get("collection_id") else lot.get("name") or "",
+                                      model=model)
+            data += part
+            if len(part) < 20:
+                break
+    except Exception as e:
+        log.warning("История продаж недоступна: %s", e)
+    now = datetime.now(timezone.utc)
+    fresh = []
+    for s in data:
+        ts = parse_time(s.get("created_at"))
+        if to_float(s, "amount") > 0 and not (ts and (now - ts).days > SALES_DAYS):
+            s["_ts"] = ts
+            fresh.append(s)
+    _cache[key] = (time.time(), fresh)
+    return fresh
+
+
+async def gift_history(lot: dict) -> dict:
+    """Покупки именно этого подарка: видно, не перекупщик ли его выставил."""
+    key = ("history", lot.get("collection_id"), gift_number(lot))
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < CACHE_TTL["history"]:
+        return hit[1][0]
+    buys = []
+    try:
+        actions = await search_sales(collection_id=lot.get("collection_id") or "",
+                                     external_collection_number=gift_number(lot))
+        for s in actions:
+            ts = parse_time(s.get("created_at"))
+            if to_float(s, "amount") > 0 and ts:
+                buys.append((ts, to_float(s, "amount")))
+    except Exception as e:
+        log.warning("История подарка %s: %s", gift_slug(lot), e)
+    buys.sort(reverse=True)
+    now = datetime.now(timezone.utc)
+    result = {
+        "buys_30d": sum(1 for ts, _ in buys if (now - ts).days <= 30),
+        "last_buy": buys[0] if buys else None,
+    }
+    _cache[key] = (time.time(), [result])
+    return result
+
+# ───────────────────────── Оценка цены ─────────────────────────
+
+
 def median_or_none(values: list[float], min_n: int) -> float | None:
     return statistics.median(values) if len(values) >= min_n else None
 
 
-async def estimate(lot: dict) -> dict | None:
-    name = lot.get("name") or ""
-    model, _ = attr(lot, "model")
+def estimate(lot: dict, listings: list[dict], sales: list[dict]) -> dict | None:
+    """Справедливая цена по похожим подаркам.
+
+    Похожие = та же модель и тот же фон. Если лот монохромный — дополнительно
+    сравниваем с другими монохромами этой модели. Берём МЕНЬШЕЕ из
+    «минимальной цены похожего лота» и «медианы продаж похожих» — консервативно.
+    """
     backdrop, _ = attr(lot, "backdrop")
-    if model == "?":
-        return None
+    mono = is_mono(lot)
+    others = [x for x in listings if x.get("id") != lot.get("id") and to_float(x) > 0]
 
-    listings = [x for x in await cached("listings", name, lot.get("collection_id") or "", model) if x.get("id") != lot.get("id")]
-    sales_raw = await cached("sales", name, lot.get("collection_id") or "", model)
+    def group(items, same_backdrop: bool, mono_peer: bool):
+        out = []
+        for x in items:
+            nft = x.get("nft") or x
+            if same_backdrop and attr(nft, "backdrop")[0] != backdrop:
+                continue
+            if mono_peer and not is_mono(nft):
+                continue
+            out.append(x)
+        return out
 
-    def price(x, field="price"):
-        try:
-            return float(x.get(field) or 0)
-        except ValueError:
-            return 0.0
-
-    ask_m = [price(x) for x in listings if price(x) > 0]
-    ask_mb = [price(x) for x in listings if price(x) > 0 and attr(x, "backdrop")[0] == backdrop]
-
-    now = datetime.now(timezone.utc)
-    sales_m, sales_mb, last_sale = [], [], None
-    for s in sales_raw:
-        amount = price(s, "amount")
-        ts = parse_time(s.get("created_at"))
-        if amount <= 0 or (ts and (now - ts).days > SALES_DAYS):
-            continue
-        sales_m.append(amount)
-        if attr(s.get("nft") or {}, "backdrop")[0] == backdrop:
-            sales_mb.append(amount)
-        if ts and (last_sale is None or ts > last_sale):
-            last_sale = ts
+    ask_m = [to_float(x) for x in others]
+    ask_mb = [to_float(x) for x in group(others, True, False)]
+    ask_mono = [to_float(x) for x in group(others, False, True)] if mono else []
+    sales_m = [to_float(s, "amount") for s in sales]
+    sales_mb = [to_float(s, "amount") for s in group(sales, True, False)]
+    sales_mono = [to_float(s, "amount") for s in group(sales, False, True)] if mono else []
 
     floor_m = min(ask_m) if ask_m else None
     floor_mb = min(ask_mb) if ask_mb else None
+    floor_mono = min(ask_mono) if ask_mono else None
     med_m = median_or_none(sales_m, 3)
     med_mb = median_or_none(sales_mb, 2)
+    med_mono = median_or_none(sales_mono, 2)
 
-    # Консервативная оценка: берём МЕНЬШЕЕ из «за сколько выставлено» и «за сколько реально продают».
-    ask = floor_mb or floor_m
-    sold = med_mb or med_m
+    # Чем точнее группа похожих, тем выше приоритет
+    if floor_mb or med_mb:
+        ask, sold, basis = floor_mb, med_mb, "модель + фон"
+    elif mono and (floor_mono or med_mono):
+        ask, sold, basis = floor_mono, med_mono, "монохромы этой модели"
+    else:
+        ask, sold, basis = floor_m, med_m, "модель"
+    # если у точной группы чего-то не хватает — добираем из модели
+    ask = ask or floor_m
+    sold = sold or med_m
     candidates = [v for v in (ask, sold) if v]
     if not candidates:
         return None
-    fair = min(candidates)
 
+    last_sale = max((s["_ts"] for s in sales if s.get("_ts")), default=None)
     return {
-        "fair": fair,
+        "fair": min(candidates), "basis": basis, "mono": mono, "mono_share": mono_of(lot),
         "floor_m": floor_m, "n_ask_m": len(ask_m),
         "floor_mb": floor_mb, "n_ask_mb": len(ask_mb),
+        "floor_mono": floor_mono, "n_ask_mono": len(ask_mono),
         "med_m": med_m, "n_sales_m": len(sales_m),
         "med_mb": med_mb, "n_sales_mb": len(sales_mb),
+        "med_mono": med_mono, "n_sales_mono": len(sales_mono),
         "last_sale": last_sale,
         "only_listings": sold is None,
     }
 
+
+def is_locked(lot: dict) -> datetime | None:
+    ts = parse_time(lot.get("unlocks_at"))
+    return ts if ts and ts > datetime.now(timezone.utc) else None
+
+
+def deal_score(discount: float, roi: float, est: dict, hist: dict | None, lot: dict) -> tuple[int, list[str]]:
+    """Насколько стоит брать: 0–100 и короткие причины."""
+    notes = []
+    score = min(35.0, max(0.0, discount) * 35 / 30)                 # скидка: 30% и выше = 35 баллов
+    score += min(20.0, max(0.0, roi) * 20 / 25)                      # чистая доходность: 25% = 20 баллов
+    liq = est["n_sales_m"]
+    score += min(15.0, liq * 15 / 20)                                # ликвидность: 20+ продаж за 30 дн.
+    if liq < 3:
+        notes.append("мало продаж модели — может долго не продаваться")
+    if est["n_sales_mb"] >= 2 or est["n_sales_mono"] >= 2:
+        score += 10                                                  # цена подтверждена продажами похожих
+    elif not est["only_listings"]:
+        score += 5
+    else:
+        notes.append("оценка только по выставленным лотам")
+    if est["last_sale"] and (datetime.now(timezone.utc) - est["last_sale"]).days <= 1:
+        score += 5
+    bonus = 0
+    if est["mono"]:
+        bonus += 8
+    if number_tag(gift_number(lot)):
+        bonus += 5
+    if (attr(lot, "backdrop")[1] or 100) < 1 or (attr(lot, "symbol")[1] or 100) < 0.3:
+        bonus += 4
+    score += min(15, bonus)
+    if is_locked(lot):
+        score -= 10
+        notes.append("заблокирован — перепродать сразу нельзя")
+    if hist and hist["last_buy"]:
+        days = (datetime.now(timezone.utc) - hist["last_buy"][0]).days
+        if days <= 7:
+            score -= 10
+            notes.append("недавно перекупили — продавец, скорее всего, флиппер")
+    return max(0, min(100, round(score))), notes
+
+
+def verdict(score: int) -> str:
+    return "🟢 брать" if score >= 70 else "🟡 можно, но проверьте" if score >= 45 else "🔴 рискованно"
+
 # ───────────────────────── Проверка лотов ─────────────────────────
 
+NOTIFIED_FILE = STATE_DIR / "notified.json"
+notified: dict[str, float] = load_json(NOTIFIED_FILE, {})
 
-async def check_lot(bot: Bot, lot: dict, stats: dict | None = None) -> bool:
-    try:
-        price = float(lot.get("price") or 0)
-    except ValueError:
-        return False
-    cost = price * (1 + BUYER_FEE)
-    if price <= 0 or cost > settings["balance"]:
-        return False
 
-    est = await estimate(lot)
-    if not est:
-        if stats is not None:
+async def evaluate_model(bot: Bot, sample: dict, stats: dict) -> None:
+    """Оценивает ВСЕ дешёвые лоты модели, а не только только что выставленный."""
+    listings = await model_listings(sample)
+    sales = await model_sales(sample)
+    if not listings:
+        return
+    # Узнаём цвета для фонов, которые встречаются среди лотов и продаж модели
+    for nft in [sample] + listings + [s.get("nft") or {} for s in sales]:
+        if nft.get("name") and gift_number(nft):
+            await learn_colors(nft)
+
+    deals = []
+    for lot in listings:
+        price = to_float(lot)
+        cost = price * (1 + BUYER_FEE)
+        if price <= 0 or cost > settings["balance"]:
+            continue
+        est = estimate(lot, listings, sales)
+        stats["checked"] += 1
+        if not est:
             stats["no_estimate"] += 1
-        return False
-    fair = est["fair"]
-    discount = (1 - price / fair) * 100
-    sell_price = fair * (1 - UNDERCUT)
-    net = sell_price * (1 - SELLER_FEE) - cost
-    if stats is not None:
+            continue
+        fair = est["fair"]
+        discount = (1 - price / fair) * 100
+        sell_price = fair * (1 - UNDERCUT)
+        net = sell_price * (1 - SELLER_FEE) - cost
         stats["estimated"] += 1
         stats["with_sales"] += not est["only_listings"]
         stats["top"].append((discount, net, f"{lot.get('name')} #{gift_number(lot)} "
-                             f"({attr(lot, 'model')[0]}): {fmt(price)} → оценка {fmt(fair)}"))
-    log.info("Лот %s #%s: цена %s, оценка %s, скидка %.1f%%, прибыль %.2f",
-             lot.get("name"), gift_number(lot), price, fair, discount, net)
-    if discount < settings["discount"] or net < settings["min_profit"]:
-        return False
+                             f"({attr(lot, 'model')[0]}{', моно' if est['mono'] else ''}): "
+                             f"{fmt(price)} → {fmt(fair)}"))
+        log.info("Лот %s: цена %s, оценка %s (%s), скидка %.1f%%, прибыль %.2f, моно %s",
+                 gift_slug(lot), price, fair, est["basis"], discount, net, est["mono_share"])
+        if discount < settings["discount"] or net < settings["min_profit"]:
+            continue
+        if lot.get("id") in notified and price >= notified[lot["id"]]:
+            continue  # уже присылали по этой или меньшей цене
+        deals.append((lot, price, cost, discount, sell_price, net, est))
 
-    await bot.send_message(OWNER_ID, format_lot(lot, price, cost, discount, sell_price, net, est),
-                           disable_web_page_preview=False)
-    return True
+    for lot, price, cost, discount, sell_price, net, est in sorted(deals, key=lambda d: -d[3]):
+        hist = await gift_history(lot)
+        score, notes = deal_score(discount, net / cost * 100, est, hist, lot)
+        text = format_lot(lot, price, cost, discount, sell_price, net, est, hist, score, notes, listings)
+        await bot.send_message(OWNER_ID, text, disable_web_page_preview=False)
+        notified[lot["id"]] = price
+        stats["found"] += 1
+    if deals:
+        NOTIFIED_FILE.write_text(json.dumps(dict(list(notified.items())[-3000:])), encoding="utf-8")
 
 
-def fmt(v: float | None) -> str:
-    return f"{v:.2f}".rstrip("0").rstrip(".") if v is not None else "—"
-
-
-def format_lot(lot, price, cost, discount, sell_price, net, est) -> str:
+def format_lot(lot, price, cost, discount, sell_price, net, est, hist, score, notes, listings) -> str:
     model, m_r = attr(lot, "model")
     backdrop, b_r = attr(lot, "backdrop")
     symbol, s_r = attr(lot, "symbol")
     pct = lambda r: f" ({r:g}%)" if r is not None else ""
     num = gift_number(lot)
     num_tag = number_tag(num)
-    mono = monochrome(model, backdrop)
+    now = datetime.now(timezone.utc)
 
     lines = [f"🔥 <b>−{discount:.0f}%</b> · <b>{lot.get('name')} #{num}</b>",
+             f"⭐ Оценка сделки: <b>{score}/100</b> — {verdict(score)}",
+             "",
              f"🧸 Модель: {model}{pct(m_r)}",
              f"🎨 Фон: {backdrop}{pct(b_r)}",
              f"✳️ Символ: {symbol}{pct(s_r)}"]
-    if mono:
-        lines.append(f"⚫ Похоже на монохром ({mono}: модель и фон одного цвета)")
+    if est["mono_share"] is not None:
+        share = est["mono_share"] * 100
+        lines.append(f"⚫ Монохром: <b>да</b> ({share:.0f}% цвета модели совпадает с фоном)" if est["mono"]
+                     else f"⚪ Монохром: нет ({share:.0f}% совпадения цвета)")
     if num_tag:
         lines.append(f"🔢 Номер #{num}: {num_tag}")
 
     lines += ["",
               f"💰 Цена: <b>{fmt(price)} TON</b> → с комиссией покупателя {fmt(cost)}",
-              f"📊 Оценка рынка: <b>{fmt(est['fair'])} TON</b>",
-              f"  • мин. лот модель+фон: {fmt(est['floor_mb'])} ({est['n_ask_mb']} шт.)",
-              f"  • мин. лот модели: {fmt(est['floor_m'])} ({est['n_ask_m']} шт.)",
-              f"  • продажи модель+фон: медиана {fmt(est['med_mb'])} (n={est['n_sales_mb']})",
-              f"  • продажи модели: медиана {fmt(est['med_m'])} (n={est['n_sales_m']})"]
+              f"📊 Оценка рынка: <b>{fmt(est['fair'])} TON</b> (по группе: {est['basis']})",
+              f"  • мин. лот модель+фон: {fmt(est['floor_mb'])} ({est['n_ask_mb']} шт.)"]
+    if est["mono"]:
+        lines.append(f"  • мин. лот монохрома модели: {fmt(est['floor_mono'])} ({est['n_ask_mono']} шт.)")
+    lines.append(f"  • мин. лот модели: {fmt(est['floor_m'])} ({est['n_ask_m']} шт.)")
+    lines.append(f"  • продажи модель+фон: медиана {fmt(est['med_mb'])} (n={est['n_sales_mb']})")
+    if est["mono"]:
+        lines.append(f"  • продажи монохромов: медиана {fmt(est['med_mono'])} (n={est['n_sales_mono']})")
+    lines.append(f"  • продажи модели: медиана {fmt(est['med_m'])} (n={est['n_sales_m']})")
     if est["last_sale"]:
-        days = (datetime.now(timezone.utc) - est["last_sale"]).days
-        lines.append(f"  • последняя продажа: {'сегодня' if days == 0 else f'{days} дн. назад'}")
-    if est["only_listings"]:
-        lines.append("⚠️ Мало продаж — оценка только по выставленным лотам, ликвидность под вопросом")
+        days = (now - est["last_sale"]).days
+        lines.append(f"  • последняя продажа модели: {'сегодня' if days == 0 else f'{days} дн. назад'}")
+
+    # Похожие лоты на рынке — чтобы сравнить глазами
+    same_group = [x for x in listings if x.get("id") != lot.get("id") and (
+        attr(x, "backdrop")[0] == backdrop or (est["mono"] and is_mono(x)))][:3]
+    if same_group:
+        lines.append("")
+        lines.append("🔍 Похожие на рынке:")
+        for x in same_group:
+            tag = " · моно" if is_mono(x) else ""
+            lines.append(f"  • #{gift_number(x)} — {fmt(to_float(x))} TON ({attr(x, 'backdrop')[0]}{tag})")
+
+    lines.append("")
+    if hist and hist["last_buy"]:
+        ts, amount = hist["last_buy"]
+        days = (now - ts).days
+        markup = (price / amount - 1) * 100 if amount else 0
+        lines.append(f"🕓 Этот подарок покупали {'сегодня' if days == 0 else f'{days} дн. назад'} "
+                     f"за {fmt(amount)} TON (сейчас {markup:+.0f}%). Покупок за 30 дн.: {hist['buys_30d']}")
+    else:
+        lines.append("🕓 Недавних покупок этого подарка нет — не перекупленный")
 
     roi = net / cost * 100
-    lines += ["",
-              f"💸 Если выставить за {fmt(sell_price)}: чистыми <b>{net:+.2f} TON ({roi:+.0f}%)</b>",
+    lines += [f"💸 Если выставить за {fmt(sell_price)}: чистыми <b>{net:+.2f} TON ({roi:+.0f}%)</b>",
               f"   (комиссия продавца {SELLER_FEE * 100:g}%, покупателя {BUYER_FEE * 100:g}%)"]
-    if mono or num_tag:
-        lines.append("✨ Монохром/номер в оценку не заложены — это возможный бонус сверху")
-    if lot.get("unlocks_at"):
-        lines.append(f"🔒 Заблокирован до: {lot['unlocks_at']}")
+    locked = is_locked(lot)
+    if locked:
+        lines.append(f"🔒 Заблокирован до {locked:%d.%m %H:%M} UTC")
+    if notes:
+        lines.append("⚠️ " + "; ".join(notes))
     lines += ["", f"🎁 {nft_link(lot)}", "🛒 Купить: https://t.me/portals"]
     return "\n".join(lines)
 
@@ -561,10 +790,11 @@ scan_lock = asyncio.Lock()
 
 
 async def scan(bot: Bot, pages: int = 1, recheck: bool = False) -> dict:
-    """recheck=True — проверить и уже просмотренные лоты (для /scan)."""
+    """Смотрит новые лоты и для каждой встреченной модели проверяет все её дешёвые лоты."""
     stats = {"lots": 0, "checked": 0, "found": 0, "errors": 0, "first_error": "",
              "estimated": 0, "with_sales": 0, "no_estimate": 0, "top": []}
     max_price = settings["balance"] / (1 + BUYER_FEE)
+    done_models = set()
     async with scan_lock:
         for page in range(pages):
             lots = await search_listings("listed_at desc", limit=20, offset=page * 20, max_price=max_price)
@@ -574,22 +804,25 @@ async def scan(bot: Bot, pages: int = 1, recheck: bool = False) -> dict:
                 if not lot_id or (lot_id in seen_ids and not recheck):
                     continue
                 remember(lot_id)
-                stats["checked"] += 1
+                key = (lot.get("collection_id"), attr(lot, "model")[0])
+                if key in done_models:
+                    continue
+                done_models.add(key)
                 try:
-                    stats["found"] += await check_lot(bot, lot, stats)
+                    await evaluate_model(bot, lot, stats)
                 except Exception as e:
                     stats["errors"] += 1
                     stats["first_error"] = stats["first_error"] or str(e)[:300]
-                    log.warning("Лот %s: %s", lot_id, e)
-                    if stats["errors"] >= 3 and stats["checked"] == stats["errors"]:
+                    log.warning("Модель %s: %s", key, e)
+                    if stats["errors"] >= 3 and stats["estimated"] == 0:
                         raise RuntimeError(f"Все проверки падают: {stats['first_error']}")
             if len(lots) < 20:
                 break
         save_state()
     stats["top"].sort(key=lambda x: -x[0])
-    log.info("Скан: лотов %s, проверено %s, оценено %s (с продажами %s), без оценки %s, найдено %s, ошибок %s",
-             stats["lots"], stats["checked"], stats["estimated"], stats["with_sales"],
-             stats["no_estimate"], stats["found"], stats["errors"])
+    log.info("Скан: лотов %s, моделей %s, проверено %s, оценено %s (с продажами %s), найдено %s, ошибок %s",
+             stats["lots"], len(done_models), stats["checked"], stats["estimated"], stats["with_sales"],
+             stats["found"], stats["errors"])
     return stats
 
 
